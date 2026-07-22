@@ -8,7 +8,6 @@ import { TimestampEditor } from './components/TimestampEditor';
 import { ExportPanel } from './components/ExportPanel';
 import { TimeOffsetModal } from './components/TimeOffsetModal';
 import { SearchReplaceModal } from './components/SearchReplaceModal';
-import { SAMPLE_HANSEL_AND_GRETEL } from './data/sampleTranscripts';
 import {
   FileAudio,
   FileVideo,
@@ -21,15 +20,10 @@ import {
   Plus
 } from 'lucide-react';
 
-const INITIAL_SAMPLE: TranscriptionResult = {
-  ...SAMPLE_HANSEL_AND_GRETEL,
-  id: 'sample_hansel_gretel',
-};
-
 export default function App() {
   // Array of uploaded transcripts
-  const [transcripts, setTranscripts] = useState<TranscriptionResult[]>([INITIAL_SAMPLE]);
-  const [activeId, setActiveId] = useState<string>('sample_hansel_gretel');
+  const [transcripts, setTranscripts] = useState<TranscriptionResult[]>([]);
+  const [activeId, setActiveId] = useState<string>('');
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -113,11 +107,7 @@ export default function App() {
 
   // Transcribe new batch of files and append
   const handleBatchSuccess = (newResults: TranscriptionResult[]) => {
-    setTranscripts((prev) => {
-      // Filter out any initial placeholder if user uploads custom files
-      const cleanPrev = prev.filter((t) => t.id !== 'sample_hansel_gretel');
-      return [...cleanPrev, ...newResults];
-    });
+    setTranscripts((prev) => [...prev, ...newResults]);
 
     if (newResults.length > 0) {
       const firstId = newResults[0].id || newResults[0].metadata.audioName;
@@ -133,46 +123,65 @@ export default function App() {
     setErrorMessage(null);
 
     const newTranscripts: TranscriptionResult[] = [];
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    for (const file of files) {
-      try {
-        const isVideo = file.type.startsWith('video/');
-        const reader = new FileReader();
+    for (let idx = 0; idx < files.length; idx++) {
+      const file = files[idx];
 
-        const base64Promise = new Promise<string>((resolve, reject) => {
-          reader.readAsDataURL(file);
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = () => reject(new Error(`Failed to read file ${file.name}`));
-        });
+      if (idx > 0) {
+        await delay(2500); // 2.5s delay between batch file requests to satisfy API rate limits
+      }
 
-        const base64Data = await base64Promise;
-        const localMediaUrl = URL.createObjectURL(file);
+      let success = false;
+      const maxRetries = 4;
 
-        const response = await fetch('/api/transcribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            audioBase64: base64Data,
-            mimeType: file.type || 'audio/mp3',
-            languageHint: 'English',
-            audioName: file.name,
-          }),
-        });
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const isVideo = file.type.startsWith('video/');
+          const reader = new FileReader();
 
-        const data = await response.json();
-        if (!response.ok || data.error) {
-          throw new Error(data.error || `Failed to transcribe ${file.name}`);
+          const base64Promise = new Promise<string>((resolve, reject) => {
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error(`Failed to read file ${file.name}`));
+          });
+
+          const base64Data = await base64Promise;
+          const localMediaUrl = URL.createObjectURL(file);
+
+          const response = await fetch('/api/transcribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audioBase64: base64Data,
+              mimeType: file.type || 'audio/mp3',
+              languageHint: 'English',
+              audioName: file.name,
+            }),
+          });
+
+          const data = await response.json();
+          if (!response.ok || data.error) {
+            throw new Error(data.error || `Failed to transcribe ${file.name}`);
+          }
+
+          newTranscripts.push({
+            ...data,
+            id: `tr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+            mediaUrl: localMediaUrl,
+            mediaType: isVideo ? 'video' : 'audio',
+          });
+
+          success = true;
+          break; // Success, exit retry loop
+        } catch (err: any) {
+          console.warn(`[Attempt ${attempt}/${maxRetries} failed for ${file.name}]:`, err.message);
+          if (attempt < maxRetries) {
+            await delay(1500 * Math.pow(2, attempt - 1));
+          } else {
+            setErrorMessage(`Failed to process ${file.name}: ${err.message}`);
+          }
         }
-
-        newTranscripts.push({
-          ...data,
-          id: `tr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          mediaUrl: localMediaUrl,
-          mediaType: isVideo ? 'video' : 'audio',
-        });
-      } catch (err: any) {
-        console.error(err);
-        setErrorMessage(err.message || `Error processing ${file.name}`);
       }
     }
 

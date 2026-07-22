@@ -10,7 +10,10 @@ import {
   Globe,
   AlertCircle,
   HelpCircle,
-  CheckCircle2
+  CheckCircle2,
+  Cpu,
+  Key,
+  Zap
 } from 'lucide-react';
 import { SAMPLE_PRESETS } from '../data/sampleTranscripts';
 import { TranscriptionResult } from '../types';
@@ -42,6 +45,11 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   const [language, setLanguage] = useState('English');
   const [dragOver, setDragOver] = useState(false);
 
+  // Engine selection & API key
+  const [engine, setEngine] = useState<'elevenlabs' | 'gemini'>('elevenlabs');
+  const [apiKey, setApiKey] = useState('sk_cbc7e4a4241863ada57c313ecb13c062071ce55c9005adad');
+  const [showKeyInput, setShowKeyInput] = useState(false);
+
   // Batch queue state for multi-file processing
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [currentBatchIndex, setCurrentBatchIndex] = useState(0);
@@ -72,58 +80,84 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
     });
   };
 
-  // Process a single file to API
-  const transcribeSingleFile = async (file: File): Promise<TranscriptionResult> => {
+  // Helper delay function
+  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Process a single file to API with retry backoff
+  const transcribeSingleFile = async (
+    file: File,
+    maxRetries = 3,
+    baseDelay = 1500
+  ): Promise<TranscriptionResult> => {
     const measuredDuration = await getMediaDuration(file);
 
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = async () => {
-        try {
-          const base64Data = reader.result as string;
-          const localMediaUrl = URL.createObjectURL(file);
-          const isVideo = file.type.startsWith('video/');
+    let lastError: any = null;
 
-          const response = await fetch('/api/transcribe', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              audioBase64: base64Data,
-              mimeType: file.type || 'audio/mp3',
-              languageHint: language,
-              audioName: file.name,
-              audioDuration: measuredDuration,
-            }),
-          });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await new Promise<TranscriptionResult>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.readAsDataURL(file);
+          reader.onload = async () => {
+            try {
+              const base64Data = reader.result as string;
+              const localMediaUrl = URL.createObjectURL(file);
+              const isVideo = file.type.startsWith('video/');
 
-          const data = await response.json();
+              const response = await fetch('/api/transcribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  audioBase64: base64Data,
+                  mimeType: file.type || 'audio/mp3',
+                  languageHint: language,
+                  audioName: file.name,
+                  audioDuration: measuredDuration,
+                  provider: engine,
+                  apiKey: apiKey,
+                }),
+              });
 
-          if (!response.ok || data.error) {
-            throw new Error(data.error || `Failed to process ${file.name}`);
-          }
+              const data = await response.json();
 
-          const result: TranscriptionResult = {
-            ...data,
-            id: `tr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-            mediaUrl: localMediaUrl,
-            mediaType: isVideo ? 'video' : 'audio',
-            status: 'completed',
+              if (!response.ok || data.error) {
+                throw new Error(data.error || `Failed to process ${file.name}`);
+              }
+
+              const res: TranscriptionResult = {
+                ...data,
+                id: `tr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                mediaUrl: localMediaUrl,
+                mediaType: isVideo ? 'video' : 'audio',
+                status: 'completed',
+              };
+
+              resolve(res);
+            } catch (err: any) {
+              reject(err);
+            }
           };
 
-          resolve(result);
-        } catch (err: any) {
-          reject(err);
-        }
-      };
+          reader.onerror = () => {
+            reject(new Error(`Error reading file ${file.name}`));
+          };
+        });
 
-      reader.onerror = () => {
-        reject(new Error(`Error reading file ${file.name}`));
-      };
-    });
+        return result;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[Attempt ${attempt}/${maxRetries} failed for ${file.name}]:`, err.message);
+        if (attempt < maxRetries) {
+          // Wait exponentially before next retry (1.5s, 3s, 6s)
+          await delay(baseDelay * Math.pow(2, attempt - 1));
+        }
+      }
+    }
+
+    throw lastError || new Error(`Failed to transcribe ${file.name} after ${maxRetries} attempts.`);
   };
 
-  // Process multiple files in sequence
+  // Process multiple files in sequence with pacing & retry
   const processAudioFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
@@ -143,13 +177,18 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
     for (let i = 0; i < initialQueue.length; i++) {
       setCurrentBatchIndex(i);
 
+      // Add pacing delay between consecutive requests to observe Gemini API quota
+      if (i > 0) {
+        await delay(2500);
+      }
+
       // Update current item to processing
       setBatchQueue((prev) =>
         prev.map((item, index) => (index === i ? { ...item, status: 'processing' } : item))
       );
 
       try {
-        const result = await transcribeSingleFile(initialQueue[i].file);
+        const result = await transcribeSingleFile(initialQueue[i].file, 4, 3000);
         completedResults.push(result);
 
         // Update current item to completed
@@ -173,7 +212,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
     if (completedResults.length > 0) {
       onTranscribeSuccess(completedResults);
     } else {
-      setErrorMessage('None of the uploaded files could be transcribed successfully.');
+      setErrorMessage('None of the uploaded files could be transcribed. Check server rate limits or file formats.');
     }
   };
 
@@ -290,6 +329,108 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
           Generate millisecond-accurate word-by-word and sentence-wise timestamps.
           Export directly to SRT, WebVTT with cue tags, JSON, and TSV for Adobe Premiere Pro, CapCut, DaVinci Resolve, and Final Cut.
         </p>
+      </div>
+
+      {/* Speech-to-Text Engine Selector */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 mb-6 max-w-2xl mx-auto shadow-2xl">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-3 pb-2.5 border-b border-slate-800/80">
+          <div className="flex items-center gap-2">
+            <Cpu className="w-4 h-4 text-emerald-400" />
+            <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">AI Transcription Engine</span>
+          </div>
+          {engine === 'elevenlabs' && (
+            <button
+              type="button"
+              onClick={() => setShowKeyInput(!showKeyInput)}
+              className="text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 flex items-center gap-1.5 transition bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/20"
+            >
+              <Key className="w-3 h-3 text-emerald-400" />
+              <span>{showKeyInput ? 'Hide Key' : 'ElevenLabs API Key Connected'}</span>
+            </button>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {/* ElevenLabs Option */}
+          <button
+            type="button"
+            onClick={() => setEngine('elevenlabs')}
+            className={`p-3.5 rounded-xl border text-left transition flex items-start gap-3 relative overflow-hidden ${
+              engine === 'elevenlabs'
+                ? 'bg-emerald-500/10 border-emerald-500/50 text-slate-100 shadow-lg shadow-emerald-500/10 ring-1 ring-emerald-500/30'
+                : 'bg-slate-800/40 border-slate-700/60 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+            }`}
+          >
+            <div className={`p-2 rounded-xl shrink-0 ${engine === 'elevenlabs' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-500'}`}>
+              <Sparkles className="w-4 h-4" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-1 font-bold text-xs">
+                <span className="truncate">ElevenLabs Scribe v1</span>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold uppercase shrink-0">
+                  Default
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1 leading-snug">
+                High-precision Scribe speech-to-text with acoustic word & sentence timestamps
+              </p>
+            </div>
+          </button>
+
+          {/* Gemini Option */}
+          <button
+            type="button"
+            onClick={() => setEngine('gemini')}
+            className={`p-3.5 rounded-xl border text-left transition flex items-start gap-3 relative overflow-hidden ${
+              engine === 'gemini'
+                ? 'bg-indigo-500/10 border-indigo-500/50 text-slate-100 shadow-lg shadow-indigo-500/10 ring-1 ring-indigo-500/30'
+                : 'bg-slate-800/40 border-slate-700/60 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+            }`}
+          >
+            <div className={`p-2 rounded-xl shrink-0 ${engine === 'gemini' ? 'bg-indigo-500/20 text-indigo-400' : 'bg-slate-800 text-slate-500'}`}>
+              <Zap className="w-4 h-4" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-1 font-bold text-xs">
+                <span className="truncate">Google Gemini 2.5 Flash</span>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1 leading-snug">
+                Multimodal forced alignment engine with sentence structure awareness
+              </p>
+            </div>
+          </button>
+        </div>
+
+        {/* API Key Drawer */}
+        {engine === 'elevenlabs' && showKeyInput && (
+          <div className="mt-3.5 pt-3 border-t border-slate-800/80">
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-[11px] font-semibold text-slate-300">
+                ElevenLabs API Key
+              </label>
+              <span className="text-[10px] text-slate-400 font-mono">sk_cbc7...adad</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="sk_..."
+                className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKeyInput(false)}
+                className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shrink-0"
+              >
+                Saved
+              </button>
+            </div>
+            <p className="text-[10px] text-slate-500 mt-1">
+              Your API key is passed directly to the server proxy for ElevenLabs speech-to-text API calls.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Mode Selector Tabs */}
