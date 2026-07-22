@@ -1,0 +1,6 @@
+{
+  "name": "Speech to Text Timestamp Converter",
+  "description": "Convert speech to text with precise word-by-word and sentence-wise timestamps. Export SRT, VTT, JSON, and TSV formats for video editors.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
