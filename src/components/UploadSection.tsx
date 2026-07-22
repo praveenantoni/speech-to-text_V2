@@ -118,7 +118,19 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
                 }),
               });
 
-              const data = await response.json();
+              const responseText = await response.text();
+              let data: any = {};
+              try {
+                data = JSON.parse(responseText);
+              } catch (parseErr) {
+                if (response.status === 413) {
+                  throw new Error(`File '${file.name}' is too large for serverless payload limits (~4.5MB on Vercel). Try an audio file under 4MB.`);
+                }
+                if (response.status === 404) {
+                  throw new Error('API route /api/transcribe not found. Ensure serverless functions are deployed.');
+                }
+                throw new Error(`Server returned status ${response.status}: ${responseText.slice(0, 150)}`);
+              }
 
               if (!response.ok || data.error) {
                 throw new Error(data.error || `Failed to process ${file.name}`);
